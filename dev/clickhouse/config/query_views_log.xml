@@ -1,0 +1,7 @@
+<clickhouse>
+    <query_views_log>
+        <database>system</database>
+        <table>query_views_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </query_views_log>
+</clickhouse>

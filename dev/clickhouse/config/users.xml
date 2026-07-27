@@ -1,0 +1,7 @@
+<clickhouse>
+    <users>
+        <default>
+            <log_query_views>1</log_query_views>
+        </default>
+    </users>
+</clickhouse>
