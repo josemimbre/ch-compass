@@ -10,8 +10,6 @@ var version = "dev"
 
 // NewRootCmd builds the root command and attaches all subcommands.
 func NewRootCmd() *cobra.Command {
-	var verbose bool
-
 	root := &cobra.Command{
 		Use:           "ch-compass",
 		Short:         "ClickHouse optimization recommendation engine",
@@ -20,8 +18,6 @@ func NewRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: false,
 	}
-
-	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable verbose output")
 
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newAnalyzeCmd())

@@ -78,16 +78,22 @@ internal/analyze/   collectors + analyzers + the Recommendation model
 internal/report/    text (terminal), JSON, HTML, and Markdown rendering
 ```
 
-`internal/analyze` collects table/query/mutation metrics concurrently for
-each database and runs every analyzer against them, returning one
+`internal/analyze` collects table/query/mutation/index metrics concurrently
+for each database and runs every analyzer against them, returning one
 `analyze.Result` per database. `internal/cli` and `internal/report` are the
 only things that know about flags, exit codes, and how the output looks.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for ideas on what could be added
+next.
 
 ## Add an analyzer
 
 1. Add the rule as an unexported function in `internal/analyze/<name>.go`
-   returning `[]Recommendation`.
-2. Call it from `Database()` in `internal/analyze/analyze.go`.
+   returning `[]Recommendation`. If it needs data no existing collector
+   gathers, add a collector function too and wire it into the `errgroup` in
+   `Database()`.
+2. Call the rule from `Database()` in `internal/analyze/analyze.go`.
+3. Add a human-readable label for the new `RecType` to `typeLabels` in
+   `internal/report/text.go` (used by all four output formats).
 
 ## Version at build time
 

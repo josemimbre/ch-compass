@@ -1,19 +1,19 @@
 # Code Review — ch-compass
 
-Revisión completa del proyecto (~1700 líneas, 20 archivos Go). `go vet ./...`,
-`gofmt -l .` y `go build ./...` no reportan nada. No se encontraron problemas
-de concurrencia ni de SQL injection: las goroutines en `analyze.go` no
-comparten estado, y todas las queries usan bind params (`{name:Type}`), sin
-concatenación de strings con input de usuario.
+Full review of the project (~1700 lines, 20 Go files). `go vet ./...`,
+`gofmt -l .`, and `go build ./...` report nothing. No concurrency or SQL
+injection issues were found: the goroutines in `analyze.go` don't share
+state, and every query uses bind params (`{name:Type}`), with no string
+concatenation of user input.
 
-## Alta prioridad
+## High priority
 
-### 1. Fuga de conexión en fallo de ping — ✅ corregido
-[internal/ch/client.go:59-66](internal/ch/client.go#L59-L66)
+### 1. Connection leak on failed ping — ✅ fixed
+[../internal/ch/client.go:59-66](../internal/ch/client.go#L59-L66)
 
-`clickhouse.Open` crea el pool de conexiones y si el `Ping` posterior falla,
-`conn` nunca se cierra antes de retornar el error. Cada intento de conexión
-fallido deja el pool/goroutines vivos.
+`clickhouse.Open` creates the connection pool, and if the subsequent `Ping`
+fails, `conn` is never closed before returning the error. Every failed
+connection attempt leaves the pool/goroutines alive.
 
 ```go
 conn, err := clickhouse.Open(chOpts)
@@ -22,78 +22,79 @@ if err != nil {
 }
 
 if err := conn.Ping(ctx); err != nil {
-    conn.Close() // falta esto
+    conn.Close() // missing
     return nil, err
 }
 ```
 
-### 2. El umbral de "tabla fría" no está atado a `--days` — ✅ corregido
-[internal/analyze/cold_tables.go:10](internal/analyze/cold_tables.go#L10)
+### 2. The "cold table" threshold isn't tied to `--days` — ✅ fixed
+[../internal/analyze/cold_tables.go:10](../internal/analyze/cold_tables.go#L10)
 
-`coldThreshold` está hardcodeado a 60 días, pero la ventana de accesos que
-alimenta `accesses` usa el flag `--days` (default **30**,
-[internal/cli/analyze.go:84](internal/cli/analyze.go#L84)). Con el default,
-una tabla consultada hace 31-59 días no aparece en `accesses` y sí se marca
-como fría una vez que `LastModified` pasa los 60 días → falso positivo
-estructural con la configuración por defecto.
+`coldThreshold` was hardcoded to 60 days, but the access window that
+populates `accesses` uses the `--days` flag (default **30**,
+[../internal/cli/analyze.go:84](../internal/cli/analyze.go#L84)). With the
+default, a table queried 31-59 days ago won't show up in `accesses`, yet it
+still gets flagged cold once `LastModified` crosses 60 days → a false
+positive baked into the default configuration.
 
-Fix sugerido: derivar `coldThreshold` de `days`, o exigir `days >= 60` para
-el análisis de tablas frías.
+Suggested fix: derive `coldThreshold` from `days`, or require `days >= 60`
+for cold-table analysis.
 
-### 3. Detección de uso de vistas solo matchea nombre completo `database.view`
-[internal/analyze/query_patterns.go:130-158](internal/analyze/query_patterns.go#L130-L158)
+### 3. View-usage detection only matches the fully-qualified `database.view` name
+[../internal/analyze/query_patterns.go:130-158](../internal/analyze/query_patterns.go#L130-L158)
 
-`collectRegularViewAccess` hace substring-match de `database.view` contra el
-texto crudo de la query. Si las queries usan `USE database` y referencian la
-vista sin calificar (patrón muy común), no matchea, y una vista que sí se usa
-termina recomendada para archivar/borrar. No está documentado como
-limitación, a diferencia del caveat de `query_views_log`.
+`collectRegularViewAccess` does a substring match of `database.view` against
+the raw query text. If queries use `USE database` and reference the view
+unqualified (a very common pattern), it won't match, and a view that's
+actually in use ends up recommended for archiving/dropping. This isn't
+documented as a limitation, unlike the `query_views_log` caveat.
 
-### 4. Degradación inconsistente ante tablas de sistema restringidas
-[internal/analyze/query_patterns.go](internal/analyze/query_patterns.go)
+### 4. Inconsistent degradation when system tables are restricted
+[../internal/analyze/query_patterns.go](../internal/analyze/query_patterns.go)
 
-Solo `collectMaterializedViewActivity` (líneas 196-208) maneja con gracia una
-tabla de sistema faltante/restringida vía `ExceptionCode`. `SYSTEM FLUSH
-LOGS` (línea 45) y `collectTableAccess`/`collectRegularViewAccess` (que
-necesitan `system.query_log`) no tienen el mismo fallback — un usuario sin
-privilegio para flush logs aborta todo el `analyze` en vez de degradar como
-en la ruta de MVs.
+Only `collectMaterializedViewActivity` (lines 196-208) gracefully handles a
+missing/restricted system table via `ExceptionCode`. `SYSTEM FLUSH LOGS`
+(line 45) and `collectTableAccess`/`collectRegularViewAccess` (which need
+`system.query_log`) have no equivalent fallback — a user without the flush
+logs privilege aborts the entire `analyze` run instead of degrading the way
+the MV path does.
 
-## Media prioridad
+## Medium priority
 
-### 5. Sin validación de `--days`
-[internal/cli/analyze.go:84](internal/cli/analyze.go#L84), usado directo como
-`{days:UInt32}` en varias queries. Un valor 0 o negativo falla de forma poco
-clara dentro del driver/ClickHouse en vez de un error de CLI claro.
+### 5. No validation on `--days`
+[../internal/cli/analyze.go:84](../internal/cli/analyze.go#L84), used
+directly as `{days:UInt32}` in several queries. A value of 0 or negative
+fails obscurely inside the driver/ClickHouse instead of a clear CLI error.
 
-### 6. `-v/--verbose` es un no-op
-Declarado y bindeado en [internal/cli/root.go:13,24](internal/cli/root.go)
-pero nunca leído en el resto del código (confirmado por grep). O se conecta
-o se elimina.
+### 6. `-v/--verbose` is a no-op
+Declared and bound in
+[../internal/cli/root.go:13,24](../internal/cli/root.go) but never read
+anywhere else in the code (confirmed via grep). Either wire it up or remove
+it.
 
-### 7. `os.Exit` llamado dentro de `RunE` — ✅ corregido
-[internal/cli/analyze.go:70-71](internal/cli/analyze.go#L70-L71). Evita el
-manejo de errores propio de cobra y deja un `return nil` inalcanzable justo
-después. Preferible retornar un error/código desde `RunE` y salir en
-`main.go`.
+### 7. `os.Exit` called from inside `RunE` — ✅ fixed
+[../internal/cli/analyze.go:70-71](../internal/cli/analyze.go#L70-L71).
+Bypasses cobra's own error handling and leaves an unreachable `return nil`
+right after it. Prefer returning an error/exit code from `RunE` and exiting
+in `main.go`.
 
-### 8. Huecos de cobertura de tests
-Sin tests en `internal/analyze/analyze.go`, `databases.go`,
-`mutation_stats.go`, `table_stats.go`, los helpers puros de
+### 8. Test coverage gaps
+No tests for `internal/analyze/analyze.go`, `databases.go`,
+`mutation_stats.go`, `table_stats.go`, the pure helpers in
 `query_patterns.go` (`mergeAccess`, `shortName`), `internal/report/json.go`,
-y todo `internal/cli` (p.ej. `splitTrimmed`, las validaciones de
-mutua-exclusión en `runAnalyze`), a pesar de contener lógica pura barata de
-testear.
+or all of `internal/cli` (e.g. `splitTrimmed`, the mutual-exclusion
+validation in `runAnalyze`), despite containing cheaply-testable pure logic.
 
 ## Nitpicks
 
-- **9.** `--password` ([internal/cli/analyze.go:81](internal/cli/analyze.go#L81))
-  solo texto plano, sin fallback por variable de entorno — expuesto en
-  historial de shell / `ps`.
+- **9.** `--password`
+  ([../internal/cli/analyze.go:81](../internal/cli/analyze.go#L81)) is
+  plaintext-only, with no environment-variable fallback — exposed in shell
+  history / `ps`.
 - **10.** `defer client.Close()`
-  ([internal/cli/analyze.go:129](internal/cli/analyze.go#L129)) descarta su
-  error silenciosamente.
+  ([../internal/cli/analyze.go:129](../internal/cli/analyze.go#L129))
+  silently discards its error.
 - **11.** `mergeAccess`
-  ([internal/analyze/query_patterns.go:239-265](internal/analyze/query_patterns.go#L239-L265))
-  retorna en orden de iteración de map — no determinístico, inofensivo hoy
-  pero frágil si se renderiza directamente en algún momento.
+  ([../internal/analyze/query_patterns.go:239-265](../internal/analyze/query_patterns.go#L239-L265))
+  returns in map-iteration order — non-deterministic, harmless today but
+  fragile if it's ever rendered directly at some point.
