@@ -57,15 +57,43 @@ unqualified `SELECT ... FROM user_stats` (run with `database=demo` as
 session context) now correctly marks `user_stats` as used, where it
 previously stayed flagged as unused.
 
-### 4. Inconsistent degradation when system tables are restricted
+### 4. Inconsistent degradation when system tables are restricted — ✅ fixed
 [../internal/analyze/query_patterns.go](../internal/analyze/query_patterns.go)
 
-Only `collectMaterializedViewActivity` (lines 196-208) gracefully handles a
-missing/restricted system table via `ExceptionCode`. `SYSTEM FLUSH LOGS`
-(line 45) and `collectTableAccess`/`collectRegularViewAccess` (which need
-`system.query_log`) have no equivalent fallback — a user without the flush
-logs privilege aborts the entire `analyze` run instead of degrading the way
-the MV path does.
+Only `collectMaterializedViewActivity` gracefully handled a
+missing/restricted system table via `ExceptionCode`. `SYSTEM FLUSH LOGS` and
+`collectTableAccess`/`collectRegularViewAccess` (which need
+`system.query_log`) had no equivalent fallback — a user without the flush
+logs privilege aborted the entire `analyze` run instead of degrading the way
+the MV path did.
+
+Fixed by extracting a shared `degradable`/`degradeOrPropagate` helper (in
+`query_patterns.go`) applied consistently to all four query-log-dependent
+calls: `SYSTEM FLUSH LOGS`, `collectTableAccess`, `collectRegularViewAccess`,
+and `collectMaterializedViewActivity`. Each degrades — writes a note, keeps
+going with reduced accuracy — for a missing table (code 60) or an
+insufficient grant (code 497, `ACCESS_DENIED`), and still propagates any
+other error as a hard failure rather than silently swallowing it (the old MV
+path's catch-all `else` branch used to swallow *any* error, which was
+actually over-lenient in the other direction).
+
+While verifying this against a restricted ClickHouse user, found and fixed a
+second, deeper bug this depended on: `ch.ExceptionCode`
+([../internal/ch/client.go](../internal/ch/client.go)) only handled the
+native-protocol `*clickhouse.Exception` type via `errors.As`, but `Connect`
+uses the **HTTP** protocol, where `clickhouse-go/v2` never constructs that
+type — errors just wrap the raw response body as a plain string. So
+`ExceptionCode` always returned `(0, false)` in practice, meaning the
+pre-existing MV fallback (and the new one) silently never actually
+triggered on a real connection. Fixed by falling back to parsing the
+`Code: N.` prefix ClickHouse always puts at the start of its plaintext
+error body when `errors.As` doesn't match.
+
+Verified against a live ClickHouse instance with a `restricted` user
+granted `SELECT` on `demo.*` and the non-query-log system tables only (no
+`system.query_log`/`system.query_views_log` access, no `SYSTEM FLUSH LOGS`):
+`analyze` now prints four notes and completes with reduced accuracy instead
+of aborting.
 
 ## Medium priority
 

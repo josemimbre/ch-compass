@@ -11,9 +11,36 @@ import (
 	"github.com/josemimbre/ch-compass/internal/ch"
 )
 
-// unknownTableCode is the ClickHouse exception code returned when a system
-// table (e.g. query_views_log) does not exist on the server.
-const unknownTableCode = 60
+const (
+	// unknownTableCode is the ClickHouse exception code returned when a
+	// system table (e.g. query_views_log) does not exist on the server.
+	unknownTableCode = 60
+	// accessDeniedCode is the ClickHouse exception code returned when the
+	// connected user lacks the grant needed to read a system table or run
+	// SYSTEM FLUSH LOGS.
+	accessDeniedCode = 497
+)
+
+// degradable reports whether err represents an optional metric source being
+// unavailable — a missing system table or an insufficient grant — rather
+// than an unexpected failure. Query-log-derived detection (table access,
+// unused views, cold tables) degrades gracefully for these instead of
+// aborting the whole analyze run; any other error is still propagated.
+func degradable(err error) bool {
+	code, ok := ch.ExceptionCode(err)
+	return ok && (code == unknownTableCode || code == accessDeniedCode)
+}
+
+// degradeOrPropagate reports whether err is degradable. If so, it writes a
+// note describing the reduced accuracy to notes and returns true so the
+// caller can continue with an empty/partial result instead of failing.
+func degradeOrPropagate(err error, notes io.Writer, feature, impact string) bool {
+	if !degradable(err) {
+		return false
+	}
+	fmt.Fprintf(notes, "Note: %s (%v). %s\n", feature, err, impact)
+	return true
+}
 
 type accessRow struct {
 	Name           string    `ch:"table_name"`
@@ -40,19 +67,23 @@ type mvAccessRow struct {
 // queryPatterns collects query access data for all tables and views in
 // database over the trailing days window. It flushes system logs first,
 // then merges table access, regular view usage, and materialized view
-// trigger activity into a single list. Notes about unavailable system
-// tables are written to notes.
+// trigger activity into a single list. Any of these three sources can be
+// unavailable (missing table or insufficient grants) without aborting the
+// whole analyze run — a note explaining the reduced accuracy is written to
+// notes instead, and that source contributes no data.
 func queryPatterns(ctx context.Context, client *ch.Client, database string, days int, notes io.Writer) ([]TableAccess, error) {
 	if err := client.Exec(ctx, "-- Force lazy system tables to be created and flush buffered log entries\nSYSTEM FLUSH LOGS"); err != nil {
-		return nil, err
+		if !degradeOrPropagate(err, notes, "could not flush system logs", "Query-log-based detection may reflect stale data.") {
+			return nil, err
+		}
 	}
 
-	tableAccess, err := collectTableAccess(ctx, client, database, days)
+	tableAccess, err := collectTableAccess(ctx, client, database, days, notes)
 	if err != nil {
 		return nil, err
 	}
 
-	viewAccess, err := collectRegularViewAccess(ctx, client, database, days)
+	viewAccess, err := collectRegularViewAccess(ctx, client, database, days, notes)
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +96,7 @@ func queryPatterns(ctx context.Context, client *ch.Client, database string, days
 	return mergeAccess(tableAccess, viewAccess, mvAccess), nil
 }
 
-func collectTableAccess(ctx context.Context, client *ch.Client, database string, days int) ([]TableAccess, error) {
+func collectTableAccess(ctx context.Context, client *ch.Client, database string, days int, notes io.Writer) ([]TableAccess, error) {
 	var rows []accessRow
 	err := client.Select(ctx, &rows, `
 		-- Table access: count queries per table from the query log
@@ -97,13 +128,16 @@ func collectTableAccess(ctx context.Context, client *ch.Client, database string,
 		ch.Named("user_agent", ch.UserAgent),
 	)
 	if err != nil {
+		if degradeOrPropagate(err, notes, "system.query_log is not accessible", "Table access and cold-table detection may be inaccurate.") {
+			return nil, nil
+		}
 		return nil, err
 	}
 
 	return toTableAccess(rows), nil
 }
 
-func collectRegularViewAccess(ctx context.Context, client *ch.Client, database string, days int) ([]TableAccess, error) {
+func collectRegularViewAccess(ctx context.Context, client *ch.Client, database string, days int, notes io.Writer) ([]TableAccess, error) {
 	var viewRows []struct {
 		Name string `ch:"name"`
 	}
@@ -169,6 +203,9 @@ func collectRegularViewAccess(ctx context.Context, client *ch.Client, database s
 		ch.Named("patterns", patterns),
 	)
 	if err != nil {
+		if degradeOrPropagate(err, notes, "system.query_log is not accessible", "Unused-view detection may be inaccurate.") {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -224,9 +261,11 @@ func collectMaterializedViewActivity(ctx context.Context, client *ch.Client, dat
   And set log_query_views=1 for the user profile.`)
 			return nil, nil
 		}
+		if degradeOrPropagate(err, notes, "system.query_views_log is not accessible", "Unused-materialized-view detection may be inaccurate.") {
+			return nil, nil
+		}
 
-		fmt.Fprintf(notes, "Note: could not query system.query_views_log: %v\n", err)
-		return nil, nil
+		return nil, err
 	}
 
 	access := make([]TableAccess, 0, len(rows))

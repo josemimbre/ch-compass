@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"strconv"
 	"sync"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -118,11 +120,33 @@ func Named(name string, value any) any {
 	return clickhouse.Named(name, value)
 }
 
+// exceptionCodePattern matches the "Code: N." prefix ClickHouse puts at the
+// start of every plaintext exception body, e.g.
+// `Code: 497. DB::Exception: ... (ACCESS_DENIED)`.
+var exceptionCodePattern = regexp.MustCompile(`Code: (\d+)\.`)
+
 // ExceptionCode returns the ClickHouse error code carried by err, if any.
+//
+// Over the native protocol the driver decodes a structured *clickhouse.Exception,
+// but over HTTP (what Connect uses) it never does — client errors just wrap
+// the raw response body as a plain string. So this also falls back to
+// parsing the "Code: N." prefix ClickHouse always puts at the start of that
+// body.
 func ExceptionCode(err error) (int32, bool) {
+	if err == nil {
+		return 0, false
+	}
+
 	var exc *clickhouse.Exception
 	if errors.As(err, &exc) {
 		return exc.Code, true
 	}
+
+	if m := exceptionCodePattern.FindStringSubmatch(err.Error()); m != nil {
+		if code, parseErr := strconv.ParseInt(m[1], 10, 32); parseErr == nil {
+			return int32(code), true
+		}
+	}
+
 	return 0, false
 }

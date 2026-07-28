@@ -33,6 +33,46 @@ go run ./cmd/ch-compass analyze --all-databases --format html --output report.ht
 go run ./cmd/ch-compass analyze --database mydb --format md --output report.md
 ```
 
+## Permissions
+
+ch-compass is read-only — it never executes the `DROP VIEW` / `ALTER TABLE
+... DROP INDEX` / `KILL MUTATION` statements it suggests, only prints them.
+It only ever runs `SELECT` queries plus `SYSTEM FLUSH LOGS`, so the
+ClickHouse user it connects as only needs grants for those.
+
+Minimum grants to analyze a database, with every check fully working:
+
+```sql
+GRANT SELECT ON mydb.* TO ch_compass;
+
+GRANT SELECT ON system.tables TO ch_compass;
+GRANT SELECT ON system.parts TO ch_compass;
+GRANT SELECT ON system.mutations TO ch_compass;
+GRANT SELECT ON system.data_skipping_indices TO ch_compass;
+GRANT SELECT ON system.query_log TO ch_compass;
+GRANT SELECT ON system.query_views_log TO ch_compass;
+GRANT SYSTEM FLUSH LOGS ON *.* TO ch_compass;
+```
+
+`GRANT SELECT ON mydb.*` matters even though ch-compass never reads a row of
+actual table data: ClickHouse filters `system.tables`/`system.parts`/etc. to
+only the databases/tables the connecting user can see, so without it those
+system tables look empty for `mydb` regardless of the `system.*` grants
+above.
+
+`--all-databases` additionally needs `GRANT SELECT ON system.databases TO
+ch_compass` plus `SELECT` on every database it should discover (or just
+`GRANT SELECT ON *.* TO ch_compass` for simplicity).
+
+None of this is strictly required — `system.query_log`,
+`system.query_views_log`, and `SYSTEM FLUSH LOGS` are all optional. Missing
+any of them prints a `Note: ...` explaining what's degraded (e.g. "unused
+view" detection becomes unreliable without `system.query_log`) and the run
+still completes, rather than aborting. `system.tables`/`system.parts`/
+`system.mutations`/`system.data_skipping_indices` are effectively required
+in practice — without them the corresponding analyzer has nothing to work
+from.
+
 ## Dev ClickHouse
 
 `compose.yml` spins up a ClickHouse server seeded with sample tables/views
