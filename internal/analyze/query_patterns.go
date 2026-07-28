@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -121,14 +122,21 @@ func collectRegularViewAccess(ctx context.Context, client *ch.Client, database s
 		return nil, nil
 	}
 
-	fullNames := make([]string, len(viewRows))
+	names := make([]string, len(viewRows))
+	patterns := make([]string, len(viewRows))
 	for i, v := range viewRows {
-		fullNames[i] = fmt.Sprintf("%s.%s", database, v.Name)
+		names[i] = v.Name
+		patterns[i] = viewSearchPattern(database, v.Name)
 	}
 
 	var rows []viewAccessRow
 	err = client.Select(ctx, &rows, `
-		-- Regular view usage: single scan of query_log for all view references
+		-- Regular view usage: single scan of query_log for all view references.
+		-- Matches both qualified ("database.view", from any session) and bare
+		-- ("view", e.g. after "USE database") references via a word-boundary
+		-- regex. Bare references are only counted for queries that actually
+		-- touched this database (has(databases, ...)) to avoid conflating
+		-- same-named views across unrelated databases.
 		-- Excludes ch-compass's own queries and ClickHouse internal operations
 		SELECT
 			matched_view,
@@ -139,8 +147,9 @@ func collectRegularViewAccess(ctx context.Context, client *ch.Client, database s
 				event_time,
 				arrayJoin(
 					arrayFilter(
-						x -> positionCaseInsensitive(query, x) > 0,
-						{views:Array(String)}
+						(name, pattern) -> match(query, pattern),
+						{names:Array(String)},
+						{patterns:Array(String)}
 					)
 				) AS matched_view
 			FROM system.query_log
@@ -149,12 +158,15 @@ func collectRegularViewAccess(ctx context.Context, client *ch.Client, database s
 				AND event_time >= now() - INTERVAL {days:UInt32} DAY
 				AND http_user_agent != {user_agent:String}
 				AND query_kind = 'Select'
+				AND has(databases, {database:String})
 		)
 		GROUP BY matched_view
 	`,
 		ch.Named("days", days),
 		ch.Named("user_agent", ch.UserAgent),
-		ch.Named("views", fullNames),
+		ch.Named("database", database),
+		ch.Named("names", names),
+		ch.Named("patterns", patterns),
 	)
 	if err != nil {
 		return nil, err
@@ -164,13 +176,22 @@ func collectRegularViewAccess(ctx context.Context, client *ch.Client, database s
 	for _, r := range rows {
 		lastAccessed := r.LastAccessed
 		access = append(access, TableAccess{
-			Name:         shortName(r.Name),
+			Name:         r.Name,
 			QueryCount:   r.QueryCount,
 			LastAccessed: &lastAccessed,
 		})
 	}
 
 	return access, nil
+}
+
+// viewSearchPattern builds a case-insensitive, word-boundary regex matching
+// either the bare view name or "database.view", so both fully-qualified
+// references and unqualified ones (e.g. after "USE database") count as
+// activity.
+func viewSearchPattern(database, view string) string {
+	qualifiedPrefix := regexp.QuoteMeta(database) + `\.`
+	return `(?i)\b(?:` + qualifiedPrefix + `)?` + regexp.QuoteMeta(view) + `\b`
 }
 
 func collectMaterializedViewActivity(ctx context.Context, client *ch.Client, database string, days int, notes io.Writer) ([]TableAccess, error) {

@@ -40,14 +40,22 @@ positive baked into the default configuration.
 Suggested fix: derive `coldThreshold` from `days`, or require `days >= 60`
 for cold-table analysis.
 
-### 3. View-usage detection only matches the fully-qualified `database.view` name
-[../internal/analyze/query_patterns.go:130-158](../internal/analyze/query_patterns.go#L130-L158)
+### 3. View-usage detection only matched the fully-qualified `database.view` name — ✅ fixed
+[../internal/analyze/query_patterns.go](../internal/analyze/query_patterns.go)
 
-`collectRegularViewAccess` does a substring match of `database.view` against
-the raw query text. If queries use `USE database` and reference the view
-unqualified (a very common pattern), it won't match, and a view that's
-actually in use ends up recommended for archiving/dropping. This isn't
-documented as a limitation, unlike the `query_views_log` caveat.
+`collectRegularViewAccess` did a substring match of `database.view` against
+the raw query text. If queries used `USE database` and referenced the view
+unqualified (a very common pattern), it wouldn't match, and a view that's
+actually in use ended up recommended for archiving/dropping.
+
+Fixed by matching a word-boundary regex against either the bare view name
+or the qualified `database.view` form. Bare matches are additionally scoped
+to queries where `has(databases, {database:String})` is true, so a
+same-named view/table in a completely unrelated database can't be
+conflated with this one. Verified against a live ClickHouse instance: an
+unqualified `SELECT ... FROM user_stats` (run with `database=demo` as
+session context) now correctly marks `user_stats` as used, where it
+previously stayed flagged as unused.
 
 ### 4. Inconsistent degradation when system tables are restricted
 [../internal/analyze/query_patterns.go](../internal/analyze/query_patterns.go)
