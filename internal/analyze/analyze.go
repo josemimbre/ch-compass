@@ -2,6 +2,7 @@ package analyze
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"time"
 
@@ -14,8 +15,12 @@ import (
 // and runs every analyzer against them. The four collectors are
 // independent, so they run concurrently rather than one after another.
 // Notes about unavailable system tables are written to notes. Call
-// FlushLogs once before analyzing any database, not per call to Database.
-func Database(ctx context.Context, client *ch.Client, database string, days int, notes io.Writer) (Result, error) {
+// FlushLogs and CheckLogRetention once before analyzing any database, not
+// per call to Database — retention caps how far back table access, cold
+// tables, and unused views/MVs actually look (see LogRetention), and
+// skips the check entirely once there's no history left to draw a
+// conclusion from.
+func Database(ctx context.Context, client *ch.Client, database string, days int, retention LogRetention, notes io.Writer) (Result, error) {
 	var (
 		tables    []TableInfo
 		accesses  []TableAccess
@@ -52,11 +57,21 @@ func Database(ctx context.Context, client *ch.Client, database string, days int,
 	now := time.Now()
 	var recs []Recommendation
 	recs = append(recs, partitionStrategy(tables, database)...)
-	recs = append(recs, coldTables(tables, accesses, database, days, now)...)
 	recs = append(recs, stuckMutations(mutations, database, now)...)
-	recs = append(recs, unusedViews(tables, accesses, database, days)...)
-	recs = append(recs, unusedMaterializedViews(tables, accesses, database, days, systemSourced, notes)...)
 	recs = append(recs, duplicateIndexes(tables, indexes, database)...)
+
+	if queryLogDays := retention.QueryLog.effectiveDays(days); queryLogDays > 0 {
+		recs = append(recs, coldTables(tables, accesses, database, queryLogDays, now)...)
+		recs = append(recs, unusedViews(tables, accesses, database, queryLogDays)...)
+	} else {
+		fmt.Fprintf(notes, "Note: skipping cold-table and unused-view detection for %s — system.query_log has no usable history yet.\n", database)
+	}
+
+	if queryViewsLogDays := retention.QueryViewsLog.effectiveDays(days); queryViewsLogDays > 0 {
+		recs = append(recs, unusedMaterializedViews(tables, accesses, database, queryViewsLogDays, systemSourced, notes)...)
+	} else {
+		fmt.Fprintf(notes, "Note: skipping unused-materialized-view detection for %s — system.query_views_log has no usable history yet.\n", database)
+	}
 
 	var plainTables, views []TableInfo
 	for _, t := range tables {

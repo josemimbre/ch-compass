@@ -6,6 +6,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/josemimbre/ch-compass/internal/ch"
@@ -83,61 +84,120 @@ func FlushLogs(ctx context.Context, client *ch.Client, notes io.Writer) error {
 	return nil
 }
 
-// CheckLogRetention warns when system.query_log or system.query_views_log
-// doesn't actually retain data as far back as the requested --days window.
-// Both typically apply their own TTL/rotation independent of --days, so a
-// window longer than what's actually retained doesn't fail — it just
-// silently looks like "no activity", indistinguishable from genuinely no
-// activity. Every check that depends on these two tables (table/view
-// access, cold tables, unused views/MVs — see queryPatterns) shares this
-// blind spot, so it's checked once per run rather than once per check.
-// Retention is a server-wide property, not scoped to any one database, so
-// call this once per run alongside FlushLogs rather than once per
-// database.
-func CheckLogRetention(ctx context.Context, client *ch.Client, days int, notes io.Writer) {
-	checkTableRetention(ctx, client, "system.query_log", days, notes)
-	checkTableRetention(ctx, client, "system.query_views_log", days, notes)
+// LogRetention holds how many days of history system.query_log and
+// system.query_views_log actually retain, as measured once per run by
+// CheckLogRetention. Database uses it to cap the --days window it passes
+// to whichever check depends on the corresponding table (table access and
+// cold tables on QueryLog; unused views on QueryLog; unused materialized
+// views on QueryViewsLog), and to skip that check outright once retention
+// is too thin to draw any conclusion from — rather than confidently
+// reporting "unused" from what's actually "no history to check".
+type LogRetention struct {
+	QueryLog      logDaysRetained
+	QueryViewsLog logDaysRetained
 }
 
-func checkTableRetention(ctx context.Context, client *ch.Client, table string, days int, notes io.Writer) {
+// logDaysRetained is how many days of history one log table retains, or
+// unknown when the retention check itself couldn't run (e.g. a missing
+// grant) — treated as "don't cap", not as zero retention, since a failed
+// check says nothing about actual retention.
+type logDaysRetained struct {
+	days  int
+	known bool
+}
+
+// effectiveDays caps requested to how many days are actually retained,
+// when that's known and shorter than requested.
+func (r logDaysRetained) effectiveDays(requested int) int {
+	if r.known && r.days < requested {
+		return r.days
+	}
+	return requested
+}
+
+// CheckLogRetention measures how many days of history system.query_log and
+// system.query_views_log actually retain, and warns when that's less than
+// the requested --days window. Both typically apply their own
+// TTL/rotation independent of --days, so a window longer than what's
+// actually retained doesn't fail — it just silently looks like "no
+// activity", indistinguishable from genuinely no activity. Every check
+// that depends on these two tables (table/view access, cold tables,
+// unused views/MVs — see queryPatterns) shares this blind spot, so it's
+// checked once per run rather than once per check. Retention is a
+// server-wide property, not scoped to any one database, so call this once
+// per run alongside FlushLogs rather than once per database.
+func CheckLogRetention(ctx context.Context, client *ch.Client, days int, notes io.Writer) LogRetention {
+	tables := []string{"system.query_log", "system.query_views_log"}
+
+	// Run both tables' queries concurrently, but only write to notes
+	// afterward, from this goroutine: notes isn't guaranteed safe for
+	// concurrent use (it's a bytes.Buffer in tests and in
+	// report.WriteHTML/WriteMarkdown's buffer), and it's the one thing
+	// tableRetention's two calls would otherwise race on.
+	retained := make([]logDaysRetained, len(tables))
+	texts := make([]string, len(tables))
+	var wg sync.WaitGroup
+	for i, table := range tables {
+		wg.Add(1)
+		go func(i int, table string) {
+			defer wg.Done()
+			retained[i], texts[i] = tableRetention(ctx, client, table, days)
+		}(i, table)
+	}
+	wg.Wait()
+
+	for _, text := range texts {
+		fmt.Fprint(notes, text)
+	}
+
+	return LogRetention{QueryLog: retained[0], QueryViewsLog: retained[1]}
+}
+
+// tableRetention measures table's retention in days against days, along
+// with the note to print for a shortfall (or "" when there's nothing to
+// report — either the query failed or retention is sufficient).
+// Deliberately doesn't route failures through degradeOrPropagate: unlike
+// collectTableAccess/collectMaterializedViewActivity (which read these
+// same tables for data they need and have nothing better to say than
+// "unavailable"), a missing or inaccessible table here already gets its
+// own, more specific note from whichever collector actually needs it
+// (e.g. collectMaterializedViewActivity's dedicated note for a missing
+// query_views_log) — this check only adds value on top of a table that's
+// actually readable, so any error, known-degradable code or not, leaves
+// retention unknown (see logDaysRetained) rather than reported.
+func tableRetention(ctx context.Context, client *ch.Client, table string, days int) (logDaysRetained, string) {
 	var rows []struct {
 		Earliest time.Time `ch:"earliest"`
 	}
 	err := client.Select(ctx, &rows, `
 		-- Retention check: earliest event still retained, to catch a log
-		-- whose own TTL/rotation is shorter than the requested --days window
-		SELECT min(event_time) AS earliest
+		-- whose own TTL/rotation is shorter than the requested --days
+		-- window. event_date (not event_time) is both tables' leading
+		-- ORDER BY/PARTITION BY column, so ClickHouse can answer min()
+		-- from part metadata alone rather than scanning a column.
+		SELECT min(event_date) AS earliest
 		FROM `+client.AllReplicasSource(table)+`
 	`)
-	if err != nil || len(rows) == 0 {
-		// Silently skip: a missing/inaccessible table is already reported
-		// by whichever collector needs it (e.g. collectMaterializedViewActivity's
-		// dedicated note for a missing query_views_log) — this check only
-		// adds value on top of a table that's actually readable.
-		return
+	if err != nil || len(rows) == 0 || rows[0].Earliest.IsZero() {
+		// A failed query, or an empty table, has no earliest entry to
+		// measure retention from — leave it unknown rather than zero.
+		return logDaysRetained{}, ""
 	}
 
-	if note := retentionNote(table, rows[0].Earliest, time.Now(), days); note != "" {
-		fmt.Fprint(notes, note)
-	}
+	retainedDays := int(time.Since(rows[0].Earliest).Hours() / 24)
+	return logDaysRetained{days: retainedDays, known: true}, retentionNote(table, retainedDays, days)
 }
 
-// retentionNote returns the note to print when table's earliest retained
-// entry is more recent than days ago — meaning the requested window
-// isn't fully backed by data — or "" when retention is sufficient (or
-// earliest is zero, meaning the table has no rows at all yet, which isn't
-// a retention problem).
-func retentionNote(table string, earliest, now time.Time, days int) string {
-	if earliest.IsZero() {
-		return ""
-	}
-	retainedDays := int(now.Sub(earliest).Hours() / 24)
+// retentionNote returns the note to print when retainedDays is less than
+// days — meaning the requested window isn't fully backed by data — or ""
+// when retention is sufficient.
+func retentionNote(table string, retainedDays, days int) string {
 	if retainedDays >= days {
 		return ""
 	}
 	return fmt.Sprintf(
-		"Note: %s only retains %d day(s) of history (earliest entry %s), less than the --days %d window requested. Detection that depends on it (table/view access, cold tables, unused views/MVs) may be unreliable beyond that.\n",
-		table, retainedDays, earliest.Format("2006-01-02"), days,
+		"Note: %s only retains %d day(s) of history, less than the --days %d window requested. Detection that depends on it (table/view access, cold tables, unused views/MVs) is capped to that %d day(s) window, or skipped entirely once there's nothing left to check.\n",
+		table, retainedDays, days, retainedDays,
 	)
 }
 

@@ -105,9 +105,13 @@ from.
 own TTL/rotation, independent of `--days` — if that TTL is shorter than the
 requested window, table/view access, cold tables, and unused views/MVs all
 silently lose accuracy: no data that far back looks exactly like no
-activity that far back. ch-compass checks this once per run and prints a
-`Note: ... only retains N day(s) of history ...` when retention falls short
-of `--days`, so that blind spot doesn't pass for a clean result.
+activity that far back. ch-compass checks actual retention once per run
+and, when it falls short of `--days`, prints a `Note: ... only retains N
+day(s) of history ...` and caps table/view access, cold tables, and unused
+views/MVs to that shorter window instead of confidently claiming the full
+`--days`. Once retention is down to nothing usable (e.g. logging was just
+enabled), the affected check is skipped outright for that database rather
+than reporting "unused" from what's actually "no history to check".
 
 ## Dev ClickHouse
 
