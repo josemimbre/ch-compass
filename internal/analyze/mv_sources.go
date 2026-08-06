@@ -40,7 +40,12 @@ func hasMaterializedView(tables []TableInfo) bool {
 // Any failure here degrades gracefully — a note is written to notes and
 // an empty result returned — since this is a supplementary signal, not a
 // required one: unusedMaterializedViews just loses the extra exclusion
-// and falls back to flagging these views like any other.
+// and falls back to flagging these views like any other. Deliberately
+// broader than degradeOrPropagate's known-error-code check (see
+// query_patterns.go): dependencies_database/dependencies_table are an old
+// ClickHouse mechanism that could error in an unanticipated way on a
+// version this hasn't been tried against, and this signal should survive
+// that rather than aborting the whole analyze run over it.
 func systemSourcedMaterializedViews(ctx context.Context, client *ch.Client, database string, notes io.Writer) []string {
 	var rows []struct {
 		Name string `ch:"mv_name"`

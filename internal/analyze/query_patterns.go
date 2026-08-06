@@ -83,6 +83,64 @@ func FlushLogs(ctx context.Context, client *ch.Client, notes io.Writer) error {
 	return nil
 }
 
+// CheckLogRetention warns when system.query_log or system.query_views_log
+// doesn't actually retain data as far back as the requested --days window.
+// Both typically apply their own TTL/rotation independent of --days, so a
+// window longer than what's actually retained doesn't fail — it just
+// silently looks like "no activity", indistinguishable from genuinely no
+// activity. Every check that depends on these two tables (table/view
+// access, cold tables, unused views/MVs — see queryPatterns) shares this
+// blind spot, so it's checked once per run rather than once per check.
+// Retention is a server-wide property, not scoped to any one database, so
+// call this once per run alongside FlushLogs rather than once per
+// database.
+func CheckLogRetention(ctx context.Context, client *ch.Client, days int, notes io.Writer) {
+	checkTableRetention(ctx, client, "system.query_log", days, notes)
+	checkTableRetention(ctx, client, "system.query_views_log", days, notes)
+}
+
+func checkTableRetention(ctx context.Context, client *ch.Client, table string, days int, notes io.Writer) {
+	var rows []struct {
+		Earliest time.Time `ch:"earliest"`
+	}
+	err := client.Select(ctx, &rows, `
+		-- Retention check: earliest event still retained, to catch a log
+		-- whose own TTL/rotation is shorter than the requested --days window
+		SELECT min(event_time) AS earliest
+		FROM `+client.AllReplicasSource(table)+`
+	`)
+	if err != nil || len(rows) == 0 {
+		// Silently skip: a missing/inaccessible table is already reported
+		// by whichever collector needs it (e.g. collectMaterializedViewActivity's
+		// dedicated note for a missing query_views_log) — this check only
+		// adds value on top of a table that's actually readable.
+		return
+	}
+
+	if note := retentionNote(table, rows[0].Earliest, time.Now(), days); note != "" {
+		fmt.Fprint(notes, note)
+	}
+}
+
+// retentionNote returns the note to print when table's earliest retained
+// entry is more recent than days ago — meaning the requested window
+// isn't fully backed by data — or "" when retention is sufficient (or
+// earliest is zero, meaning the table has no rows at all yet, which isn't
+// a retention problem).
+func retentionNote(table string, earliest, now time.Time, days int) string {
+	if earliest.IsZero() {
+		return ""
+	}
+	retainedDays := int(now.Sub(earliest).Hours() / 24)
+	if retainedDays >= days {
+		return ""
+	}
+	return fmt.Sprintf(
+		"Note: %s only retains %d day(s) of history (earliest entry %s), less than the --days %d window requested. Detection that depends on it (table/view access, cold tables, unused views/MVs) may be unreliable beyond that.\n",
+		table, retainedDays, earliest.Format("2006-01-02"), days,
+	)
+}
+
 // queryPatterns collects query access data for all tables and views in
 // database over the trailing days window, merging table access, regular
 // view usage, and materialized view trigger activity into a single list.

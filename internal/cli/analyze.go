@@ -162,6 +162,11 @@ func runAnalyze(ctx context.Context, stdout, stderr io.Writer, opts analyzeOptio
 		return 1
 	}
 
+	// Same reasoning as the flush above: retention is a server-wide
+	// property of query_log/query_views_log, not scoped to any one
+	// database, so check it once rather than once per database.
+	analyze.CheckLogRetention(ctx, client, opts.days, stdout)
+
 	databases := opts.databases
 	if opts.allDatabases {
 		databases, err = analyze.ListDatabases(ctx, client)

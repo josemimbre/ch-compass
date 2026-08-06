@@ -101,6 +101,14 @@ still completes, rather than aborting. `system.tables`/`system.parts`/
 in practice — without them the corresponding analyzer has nothing to work
 from.
 
+`system.query_log` and `system.query_views_log` also typically apply their
+own TTL/rotation, independent of `--days` — if that TTL is shorter than the
+requested window, table/view access, cold tables, and unused views/MVs all
+silently lose accuracy: no data that far back looks exactly like no
+activity that far back. ch-compass checks this once per run and prints a
+`Note: ... only retains N day(s) of history ...` when retention falls short
+of `--days`, so that blind spot doesn't pass for a clean result.
+
 ## Dev ClickHouse
 
 `compose.yml` spins up a ClickHouse server seeded with sample tables/views
