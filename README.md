@@ -31,6 +31,7 @@ go run ./cmd/ch-compass analyze --database mydb,other_db --format json
 go run ./cmd/ch-compass analyze --database mydb --severity high --quiet
 go run ./cmd/ch-compass analyze --all-databases --format html --output report.html
 go run ./cmd/ch-compass analyze --database mydb --format md --output report.md
+go run ./cmd/ch-compass analyze --database mydb --cluster my_cluster
 ```
 
 ## Permissions
@@ -63,6 +64,29 @@ above.
 `--all-databases` additionally needs `GRANT SELECT ON system.databases TO
 ch_compass` plus `SELECT` on every database it should discover (or just
 `GRANT SELECT ON *.* TO ch_compass` for simplicity).
+
+Every system table ch-compass reads is per-node, which matters on a
+replicated/sharded server: connecting to a single host only sees that
+host's slice. Pass `--cluster <name>` to read cluster-wide instead — it
+needs the same grants as above readable on every node (typically identical
+users/grants across the cluster already), plus `GRANT SYSTEM FLUSH LOGS ON
+*.* TO ch_compass` to flush cluster-wide via `SYSTEM FLUSH LOGS ON CLUSTER
+<name>`. Two different ClickHouse table functions are used depending on
+what the underlying table holds:
+
+- `system.query_log`/`system.query_views_log` hold **events** — a query or
+  MV trigger is logged once, on whichever node handled it, never
+  duplicated across replicas. Without `--cluster`, activity that landed on
+  a different host than the one ch-compass is connected to won't show up,
+  which can make a still-used view, materialized view, or table look
+  unused/cold. `--cluster` reads these via `clusterAllReplicas(...)`,
+  safely unioning activity from every replica of every shard.
+- `system.tables`/`system.parts`/`system.mutations`/
+  `system.data_skipping_indices` hold **state** — on a sharded table each
+  shard holds a different slice of the data, but every replica of the same
+  shard holds (near-)identical state. `--cluster` reads these via
+  `cluster(...)` instead, one replica per shard, so row counts/sizes/part
+  counts sum correctly across shards without double-counting replicas.
 
 None of this is strictly required — `system.query_log`,
 `system.query_views_log`, and `SYSTEM FLUSH LOGS` are all optional. Missing
@@ -102,6 +126,7 @@ docker compose down
 | `-q, --quiet`     |              | Only print recommendations                                                |
 | `--debug`         |              | Print SQL queries as they run                                             |
 | `--secure`        |              | Use HTTPS/TLS for the ClickHouse connection                               |
+| `--cluster`       |              | ClickHouse cluster name; widens every check cluster-wide instead of the connected node |
 
 \* required unless `--all-databases` is passed.
 

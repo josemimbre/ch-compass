@@ -11,6 +11,7 @@ import (
 	"io"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -29,14 +30,21 @@ type Options struct {
 	Password string
 	Secure   bool
 	Debug    bool
+	// Cluster is the ClickHouse cluster name this connection belongs to,
+	// if any. When set, Client.AllReplicasSource, Client.ShardedSource,
+	// and Client.FlushLogs widen reads of per-node system tables to every
+	// host in the cluster instead of just this one — see those methods
+	// for why that matters and how they differ.
+	Cluster string
 }
 
 // Client executes queries against ClickHouse, optionally logging them.
 // Safe for concurrent use: collectors run their queries in parallel.
 type Client struct {
-	conn   clickhouse.Conn
-	debug  bool
-	stderr io.Writer
+	conn    clickhouse.Conn
+	debug   bool
+	stderr  io.Writer
+	cluster string
 
 	logMu sync.Mutex
 }
@@ -68,7 +76,7 @@ func Connect(ctx context.Context, opts Options, stderr io.Writer) (*Client, erro
 		return nil, err
 	}
 
-	return &Client{conn: conn, debug: opts.Debug, stderr: stderr}, nil
+	return &Client{conn: conn, debug: opts.Debug, stderr: stderr, cluster: opts.Cluster}, nil
 }
 
 // Close releases the underlying connection pool.
@@ -118,6 +126,68 @@ func (c *Client) logQuery(query string, args []any) {
 // Select or Exec.
 func Named(name string, value any) any {
 	return clickhouse.Named(name, value)
+}
+
+// AllReplicasSource returns the FROM-clause source for a per-node event
+// log, such as system.query_log or system.query_views_log. Those tables
+// hold one row per event on whichever node happened to handle it — never
+// duplicated across replicas — so on a replicated/sharded table the insert
+// that triggers a materialized view (or the query that reads a
+// table/view) may land on a different host in the cluster than the one
+// this Client is connected to, making an MV/table/view look unused when it
+// isn't. When the Client was connected with a Cluster, this wraps table in
+// clusterAllReplicas so activity on every replica of every shard counts —
+// safe to sum/union since no event is ever double-counted. Otherwise it
+// returns table unqualified.
+func (c *Client) AllReplicasSource(table string) string {
+	if c.cluster == "" {
+		return table
+	}
+	return "clusterAllReplicas(" + SQLStringLiteral(c.cluster) + ", " + table + ")"
+}
+
+// ShardedSource returns the FROM-clause source for a per-node state table,
+// such as system.tables, system.parts, system.mutations, or
+// system.data_skipping_indices. Those reflect locally-held state: on a
+// sharded table each shard holds a different slice of the data, but every
+// replica of the same shard holds (near-)identical state. Widening via
+// AllReplicasSource/clusterAllReplicas would therefore double- (or
+// triple-, ...-) count each shard once per replica. When the Client was
+// connected with a Cluster, this instead reads one replica per shard via
+// the cluster table function, so results can be summed across shards
+// without duplicating replicas. Otherwise it returns table unqualified.
+func (c *Client) ShardedSource(table string) string {
+	if c.cluster == "" {
+		return table
+	}
+	return "cluster(" + SQLStringLiteral(c.cluster) + ", " + table + ")"
+}
+
+// FlushLogs flushes ClickHouse's buffered system logs (query_log,
+// query_views_log, ...) so a subsequent read of them reflects recent
+// activity. When the Client was connected with a Cluster, the flush runs
+// ON CLUSTER so every node's buffered entries are visible before a
+// ClusterSource-wrapped query reads them.
+func (c *Client) FlushLogs(ctx context.Context) error {
+	query := "-- Force lazy system tables to be created and flush buffered log entries\nSYSTEM FLUSH LOGS"
+	if c.cluster != "" {
+		query += " ON CLUSTER " + QuoteIdentifier(c.cluster)
+	}
+	return c.Exec(ctx, query)
+}
+
+// SQLStringLiteral quotes s as a single-quoted SQL string literal, escaping
+// embedded single quotes. Used for values ClickHouse doesn't accept as a
+// bind parameter, such as the cluster name argument to clusterAllReplicas.
+func SQLStringLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// QuoteIdentifier backtick-quotes s as a ClickHouse identifier, escaping
+// embedded backticks. Used for values ClickHouse doesn't accept as a bind
+// parameter, such as the cluster name in ON CLUSTER.
+func QuoteIdentifier(s string) string {
+	return "`" + strings.ReplaceAll(s, "`", "``") + "`"
 }
 
 // exceptionCodePattern matches the "Code: N." prefix ClickHouse puts at the

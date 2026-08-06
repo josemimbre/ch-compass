@@ -13,7 +13,8 @@ import (
 // Database collects table, query, mutation, and index metrics for database
 // and runs every analyzer against them. The four collectors are
 // independent, so they run concurrently rather than one after another.
-// Notes about unavailable system tables are written to notes.
+// Notes about unavailable system tables are written to notes. Call
+// FlushLogs once before analyzing any database, not per call to Database.
 func Database(ctx context.Context, client *ch.Client, database string, days int, notes io.Writer) (Result, error) {
 	var (
 		tables    []TableInfo

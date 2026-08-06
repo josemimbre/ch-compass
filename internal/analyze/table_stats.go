@@ -24,19 +24,29 @@ type partRow struct {
 }
 
 // tableStats collects table and partition info for all tables and views in
-// database, from system.tables merged with system.parts.
+// database, from system.tables merged with system.parts. On a sharded
+// cluster (see ch.Client.ShardedSource) both queries aggregate across
+// shards: a sharded table holds a different slice of the data on each
+// shard, so total_rows/total_bytes/part_count are summed and
+// last_modified maxed across shards to get true cluster-wide totals
+// rather than just the slice local to whichever shard the connected node
+// belongs to. engine/sorting_key are taken with any() since DDL is
+// replicated identically to every shard. Grouping is a no-op when no
+// cluster is configured, since ShardedSource then returns exactly one row
+// per table already.
 func tableStats(ctx context.Context, client *ch.Client, database string) ([]TableInfo, error) {
 	var tables []tableRow
 	err := client.Select(ctx, &tables, `
 		-- Table metadata: list all tables/views with engine, row count, size and sorting key
 		SELECT
 			name,
-			engine,
-			total_rows,
-			total_bytes,
-			sorting_key
-		FROM system.tables
+			any(engine) AS engine,
+			sum(total_rows) AS total_rows,
+			sum(total_bytes) AS total_bytes,
+			any(sorting_key) AS sorting_key
+		FROM `+client.ShardedSource("system.tables")+`
 		WHERE database = {database:String}
+		GROUP BY name
 	`, ch.Named("database", database))
 	if err != nil {
 		return nil, err
@@ -50,7 +60,7 @@ func tableStats(ctx context.Context, client *ch.Client, database string) ([]Tabl
 			count(DISTINCT partition) AS partition_count,
 			count() AS part_count,
 			max(modification_time) AS last_modified
-		FROM system.parts
+		FROM `+client.ShardedSource("system.parts")+`
 		WHERE database = {database:String}
 			AND active = 1
 		GROUP BY table

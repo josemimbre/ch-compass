@@ -14,7 +14,27 @@ while porting.
 - **Merge pressure** — flag tables with many small active parts (e.g.
   >300) that indicate merge lag, or unusually large parts that risk memory
   pressure during merges. Data source: `system.parts`, already collected
-  by `tableStats`.
+  by `tableStats` as `TableInfo.PartCount` — no new collector needed, this
+  is analyzer-logic-only. Worth a `high` severity tier as active parts
+  approach ~5,000, the point where ZooKeeper's `jute.maxbuffer` starts
+  rejecting ALTERs on `Replicated*MergeTree` tables and queries slow down
+  noticeably ([Altinity KB](https://kb.altinity.com/altinity-kb-schema-design/how-much-is-too-much/)).
+- **Materialized views per source table** — flag source tables with many
+  MVs attached (Altinity KB: "up to a few" is optimal). Each MV re-runs its
+  query on every insert into the source table, so a source table with a
+  dozen MVs multiplies insert cost and adds inconsistency risk if one MV
+  lags or fails. Data source: `system.tables` (MV `engine_full`/dependency
+  info already exposed there) — extends the existing
+  `unusedMaterializedViews` collector rather than needing a new one.
+- **Secondary index overload** — flag tables with many skip indexes (KB:
+  roughly one to a dozen is normal) or multiple `bloom_filter` indexes in
+  particular, since a bloom filter index costs ~100x more to
+  build/maintain than a `minmax` one. Data source: `system.data_skipping_indices`,
+  already collected by `indexStats`.
+- **Wide tables** — flag tables with hundreds-to-thousands of columns;
+  KB puts "a few hundred" as fine and "thousands" as degrading insert/merge
+  performance and RAM usage. Needs a new `system.columns`-based collector
+  (`count() GROUP BY table`).
 - **Slow queries** — flag queries in `system.query_log` with a high
   `read_rows`/`read_bytes`-to-result-size ratio, or that exceed a duration
   threshold. Suggest a projection or materialized view.

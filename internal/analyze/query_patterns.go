@@ -64,20 +64,33 @@ type mvAccessRow struct {
 	TotalReadBytes uint64    `ch:"total_read_bytes"`
 }
 
-// queryPatterns collects query access data for all tables and views in
-// database over the trailing days window. It flushes system logs first,
-// then merges table access, regular view usage, and materialized view
-// trigger activity into a single list. Any of these three sources can be
-// unavailable (missing table or insufficient grants) without aborting the
-// whole analyze run — a note explaining the reduced accuracy is written to
-// notes instead, and that source contributes no data.
-func queryPatterns(ctx context.Context, client *ch.Client, database string, days int, notes io.Writer) ([]TableAccess, error) {
-	if err := client.Exec(ctx, "-- Force lazy system tables to be created and flush buffered log entries\nSYSTEM FLUSH LOGS"); err != nil {
+// FlushLogs flushes ClickHouse's buffered system logs so query-log-based
+// detection (table access, unused views, unused materialized views, cold
+// tables) reflects recent activity. SYSTEM FLUSH LOGS is a global
+// operation, not scoped to a single database, so call this once per run
+// before analyzing any database rather than once per database — repeating
+// it per database would just redo the same (potentially cluster-wide, via
+// client's Cluster) work for no benefit. A missing grant degrades
+// gracefully: a note is written to notes and nil is returned, since
+// query-log-based detection just becomes less accurate rather than
+// impossible.
+func FlushLogs(ctx context.Context, client *ch.Client, notes io.Writer) error {
+	if err := client.FlushLogs(ctx); err != nil {
 		if !degradeOrPropagate(err, notes, "could not flush system logs", "Query-log-based detection may reflect stale data.") {
-			return nil, err
+			return err
 		}
 	}
+	return nil
+}
 
+// queryPatterns collects query access data for all tables and views in
+// database over the trailing days window, merging table access, regular
+// view usage, and materialized view trigger activity into a single list.
+// Any of these three sources can be unavailable (missing table or
+// insufficient grants) without aborting the whole analyze run — a note
+// explaining the reduced accuracy is written to notes instead, and that
+// source contributes no data.
+func queryPatterns(ctx context.Context, client *ch.Client, database string, days int, notes io.Writer) ([]TableAccess, error) {
 	tableAccess, err := collectTableAccess(ctx, client, database, days, notes)
 	if err != nil {
 		return nil, err
@@ -108,7 +121,7 @@ func collectTableAccess(ctx context.Context, client *ch.Client, database string,
 			max(event_time) AS last_accessed,
 			sum(read_rows) AS total_read_rows,
 			sum(read_bytes) AS total_read_bytes
-		FROM system.query_log
+		FROM `+client.AllReplicasSource("system.query_log")+`
 		WHERE type = 'QueryFinish'
 			AND is_initial_query = 1
 			AND event_time >= now() - INTERVAL {days:UInt32} DAY
@@ -186,7 +199,7 @@ func collectRegularViewAccess(ctx context.Context, client *ch.Client, database s
 						{patterns:Array(String)}
 					)
 				) AS matched_view
-			FROM system.query_log
+			FROM `+client.AllReplicasSource("system.query_log")+`
 			WHERE type = 'QueryFinish'
 				AND is_initial_query = 1
 				AND event_time >= now() - INTERVAL {days:UInt32} DAY
@@ -241,7 +254,7 @@ func collectMaterializedViewActivity(ctx context.Context, client *ch.Client, dat
 			max(event_time) AS last_triggered,
 			sum(read_rows) AS total_read_rows,
 			sum(read_bytes) AS total_read_bytes
-		FROM system.query_views_log
+		FROM `+client.AllReplicasSource("system.query_views_log")+`
 		WHERE status = 'QueryFinish'
 			AND event_time >= now() - INTERVAL {days:UInt32} DAY
 			AND view_name LIKE concat({database:String}, '.%')

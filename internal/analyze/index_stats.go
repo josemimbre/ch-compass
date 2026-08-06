@@ -14,13 +14,17 @@ type skipIndexRow struct {
 }
 
 // indexStats collects all skip indexes for tables in database from
-// system.data_skipping_indices.
+// system.data_skipping_indices. On a sharded cluster (see
+// ch.Client.ShardedSource) this reads one replica per shard; index
+// definitions are DDL, replicated identically to every shard, so DISTINCT
+// drops the resulting duplicates instead of reporting the same index once
+// per shard.
 func indexStats(ctx context.Context, client *ch.Client, database string) ([]SkipIndex, error) {
 	var rows []skipIndexRow
 	err := client.Select(ctx, &rows, `
 		-- Skip index metadata: list all data skipping indices
-		SELECT table, name, type, expr
-		FROM system.data_skipping_indices
+		SELECT DISTINCT table, name, type, expr
+		FROM `+client.ShardedSource("system.data_skipping_indices")+`
 		WHERE database = {database:String}
 	`, ch.Named("database", database))
 	if err != nil {

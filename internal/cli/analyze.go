@@ -23,7 +23,7 @@ var errAnalyzeFailed = errors.New("analyze failed")
 func newAnalyzeCmd() *cobra.Command {
 	var (
 		host, database, username, password string
-		output                             string
+		output, cluster                    string
 		port                               int
 		format, severity                   string
 		days                               int
@@ -73,6 +73,7 @@ func newAnalyzeCmd() *cobra.Command {
 				debug:        debug,
 				quiet:        quiet,
 				days:         days,
+				cluster:      cluster,
 				format:       format,
 				output:       output,
 				minSeverity:  minSeverity,
@@ -101,13 +102,14 @@ func newAnalyzeCmd() *cobra.Command {
 	flags.BoolVar(&debug, "debug", false, "Print SQL queries as they are executed")
 	flags.BoolVarP(&quiet, "quiet", "q", false, "Only output recommendations, no connection info or table listing")
 	flags.BoolVar(&secure, "secure", false, "Use HTTPS for ClickHouse connection (TLS)")
+	flags.StringVar(&cluster, "cluster", "", "ClickHouse cluster name: widens query-log-based detection (table access, unused views/MVs) across every host in the cluster instead of just the connected node")
 
 	return cmd
 }
 
 type analyzeOptions struct {
 	host, username, password string
-	output                   string
+	output, cluster          string
 	port                     int
 	databases                []string
 	allDatabases             bool
@@ -138,6 +140,7 @@ func runAnalyze(ctx context.Context, stdout, stderr io.Writer, opts analyzeOptio
 		Password: opts.password,
 		Secure:   opts.secure,
 		Debug:    opts.debug,
+		Cluster:  opts.cluster,
 	}, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: could not connect to ClickHouse - %v\n", err)
@@ -148,6 +151,14 @@ func runAnalyze(ctx context.Context, stdout, stderr io.Writer, opts analyzeOptio
 	version, err := client.Version(ctx)
 	if err != nil {
 		fmt.Fprintf(stderr, "Error: could not query ClickHouse - %v\n", err)
+		return 1
+	}
+
+	// Flush once for the whole run rather than per database: it's a
+	// global operation (potentially cluster-wide, via opts.cluster), so
+	// repeating it per database would just redo the same work.
+	if err := analyze.FlushLogs(ctx, client, stdout); err != nil {
+		fmt.Fprintf(stderr, "Error: could not flush system logs - %v\n", err)
 		return 1
 	}
 

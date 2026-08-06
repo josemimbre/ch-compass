@@ -17,7 +17,10 @@ type mutationRow struct {
 }
 
 // mutationStats collects all mutations for database from system.mutations,
-// most recent first.
+// most recent first. On a sharded cluster (see ch.Client.ShardedSource)
+// this reads one replica per shard, since each shard queues and tracks
+// mutations over its own slice of the data independently — no dedup
+// needed, every row is already a distinct mutation on a distinct shard.
 func mutationStats(ctx context.Context, client *ch.Client, database string) ([]MutationInfo, error) {
 	var rows []mutationRow
 	err := client.Select(ctx, &rows, `
@@ -29,7 +32,7 @@ func mutationStats(ctx context.Context, client *ch.Client, database string) ([]M
 			create_time,
 			parts_to_do_names,
 			is_done
-		FROM system.mutations
+		FROM `+client.ShardedSource("system.mutations")+`
 		WHERE database = {database:String}
 		ORDER BY create_time DESC
 	`, ch.Named("database", database))
