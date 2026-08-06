@@ -13,7 +13,11 @@ It connects to a ClickHouse server, inspects `system.tables`, `system.parts`,
 - **Unused views** — regular views with no query activity in the analysis
   window.
 - **Unused materialized views** — MVs never triggered by an insert into
-  their source table.
+  their source table. MVs sourced from a `system.*` table (e.g. a
+  persisted copy of `system.query_log`) are excluded: ClickHouse's own
+  system-table writes never go through the query pipeline that populates
+  `system.query_views_log`, so this check can never observe their trigger
+  activity either way.
 - **Redundant skip indexes** — skip indexes on columns already covered by
   the table's sorting-key prefix.
 

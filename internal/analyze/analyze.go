@@ -44,13 +44,18 @@ func Database(ctx context.Context, client *ch.Client, database string, days int,
 		return Result{}, err
 	}
 
+	var systemSourced []string
+	if hasMaterializedView(tables) {
+		systemSourced = systemSourcedMaterializedViews(ctx, client, database, notes)
+	}
+
 	now := time.Now()
 	var recs []Recommendation
 	recs = append(recs, partitionStrategy(tables, database)...)
 	recs = append(recs, coldTables(tables, accesses, database, days, now)...)
 	recs = append(recs, stuckMutations(mutations, database, now)...)
 	recs = append(recs, unusedViews(tables, accesses, database, days)...)
-	recs = append(recs, unusedMaterializedViews(tables, accesses, database, days)...)
+	recs = append(recs, unusedMaterializedViews(tables, accesses, database, days, systemSourced, notes)...)
 	recs = append(recs, duplicateIndexes(tables, indexes, database)...)
 
 	var plainTables, views []TableInfo

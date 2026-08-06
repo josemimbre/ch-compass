@@ -1,6 +1,8 @@
 package analyze
 
 import (
+	"bytes"
+	"io"
 	"strings"
 	"testing"
 )
@@ -77,7 +79,7 @@ func TestUnusedMaterializedViews(t *testing.T) {
 			{Name: "hourly_events", Engine: "MaterializedView", ViewType: ViewTypeMaterialized},
 		}
 
-		recs := unusedMaterializedViews(tables, nil, "demo", 30)
+		recs := unusedMaterializedViews(tables, nil, "demo", 30, nil, io.Discard)
 		if len(recs) != 2 {
 			t.Fatalf("got %d recommendations, want 2", len(recs))
 		}
@@ -91,21 +93,21 @@ func TestUnusedMaterializedViews(t *testing.T) {
 	t.Run("does not flag materialized views that have been triggered", func(t *testing.T) {
 		tables := []TableInfo{{Name: "hourly_events", Engine: "MaterializedView", ViewType: ViewTypeMaterialized}}
 		accesses := []TableAccess{{Name: "hourly_events", QueryCount: 5}}
-		if recs := unusedMaterializedViews(tables, accesses, "demo", 30); len(recs) != 0 {
+		if recs := unusedMaterializedViews(tables, accesses, "demo", 30, nil, io.Discard); len(recs) != 0 {
 			t.Fatalf("got %d recommendations, want 0", len(recs))
 		}
 	})
 
 	t.Run("does not flag regular views", func(t *testing.T) {
 		tables := []TableInfo{{Name: "daily_events", Engine: "View", ViewType: ViewTypeRegular}}
-		if recs := unusedMaterializedViews(tables, nil, "demo", 30); len(recs) != 0 {
+		if recs := unusedMaterializedViews(tables, nil, "demo", 30, nil, io.Discard); len(recs) != 0 {
 			t.Fatalf("got %d recommendations, want 0", len(recs))
 		}
 	})
 
 	t.Run("message mentions materialized view and includes database in suggestion", func(t *testing.T) {
 		tables := []TableInfo{{Name: "old_mv", Engine: "MaterializedView", ViewType: ViewTypeMaterialized}}
-		recs := unusedMaterializedViews(tables, nil, "demo", 30)
+		recs := unusedMaterializedViews(tables, nil, "demo", 30, nil, io.Discard)
 		if len(recs) != 1 {
 			t.Fatalf("got %d recommendations, want 1", len(recs))
 		}
@@ -114,6 +116,22 @@ func TestUnusedMaterializedViews(t *testing.T) {
 		}
 		if recs[0].Suggestion != "DROP VIEW IF EXISTS demo.old_mv" {
 			t.Errorf("unexpected suggestion: %q", recs[0].Suggestion)
+		}
+	})
+
+	t.Run("skips materialized views sourced from a system.* table and notes it", func(t *testing.T) {
+		tables := []TableInfo{
+			{Name: "query_log_backup", Engine: "MaterializedView", ViewType: ViewTypeMaterialized},
+			{Name: "hourly_events", Engine: "MaterializedView", ViewType: ViewTypeMaterialized},
+		}
+		var notes bytes.Buffer
+
+		recs := unusedMaterializedViews(tables, nil, "demo", 30, []string{"query_log_backup"}, &notes)
+		if len(recs) != 1 || recs[0].Object != "hourly_events" {
+			t.Fatalf("got %+v, want only hourly_events flagged", recs)
+		}
+		if !strings.Contains(notes.String(), "1 materialized view(s) skipped") {
+			t.Errorf("expected a skip note, got %q", notes.String())
 		}
 	})
 }

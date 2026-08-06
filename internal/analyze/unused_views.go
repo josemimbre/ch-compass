@@ -1,6 +1,9 @@
 package analyze
 
-import "fmt"
+import (
+	"fmt"
+	"io"
+)
 
 // unusedViews flags regular views with no matching entry in accesses,
 // meaning no query referenced them in the last `days` days.
@@ -11,9 +14,32 @@ func unusedViews(tables []TableInfo, accesses []TableAccess, database string, da
 
 // unusedMaterializedViews flags materialized views with no matching entry
 // in accesses, meaning no insert into their source table triggered them in
-// the last `days` days.
-func unusedMaterializedViews(tables []TableInfo, accesses []TableAccess, database string, days int) []Recommendation {
-	return unusedViewsOfType(tables, accesses, database, days, ViewTypeMaterialized, TypeUnusedMaterializedView,
+// the last `days` days. Materialized views in systemSourced (see
+// systemSourcedMaterializedViews) are skipped entirely rather than
+// checked: their trigger activity structurally never reaches
+// system.query_views_log, so this check would always be a false positive
+// for them. Skipping is noted, so it reads as "excluded" rather than
+// "confirmed fine".
+func unusedMaterializedViews(tables []TableInfo, accesses []TableAccess, database string, days int, systemSourced []string, notes io.Writer) []Recommendation {
+	excluded := make(map[string]bool, len(systemSourced))
+	for _, name := range systemSourced {
+		excluded[name] = true
+	}
+
+	checked := make([]TableInfo, 0, len(tables))
+	skipped := 0
+	for _, t := range tables {
+		if t.ViewType == ViewTypeMaterialized && excluded[t.Name] {
+			skipped++
+			continue
+		}
+		checked = append(checked, t)
+	}
+	if skipped > 0 {
+		fmt.Fprintf(notes, "Note: %d materialized view(s) skipped for unused-materialized-view detection (sourced from a system.* table, so system.query_views_log can never show their trigger activity).\n", skipped)
+	}
+
+	return unusedViewsOfType(checked, accesses, database, days, ViewTypeMaterialized, TypeUnusedMaterializedView,
 		"Materialized view '%s' has not been triggered in the last %d days")
 }
 
