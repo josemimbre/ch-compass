@@ -154,10 +154,17 @@ func runAnalyze(ctx context.Context, stdout, stderr io.Writer, opts analyzeOptio
 		return 1
 	}
 
+	// analyze writes plain "Note: ..." lines for degraded detection,
+	// skipped checks, and retention shortfalls — it knows nothing about
+	// terminal styling (see the Layout section of the README). notesOut
+	// renders those as styled warnings; everything else keeps going
+	// straight to stdout unstyled, same as before.
+	notesOut := report.NewNoteWriter(stdout)
+
 	// Flush once for the whole run rather than per database: it's a
 	// global operation (potentially cluster-wide, via opts.cluster), so
 	// repeating it per database would just redo the same work.
-	if err := analyze.FlushLogs(ctx, client, stdout); err != nil {
+	if err := analyze.FlushLogs(ctx, client, notesOut); err != nil {
 		fmt.Fprintf(stderr, "Error: could not flush system logs - %v\n", err)
 		return 1
 	}
@@ -165,7 +172,7 @@ func runAnalyze(ctx context.Context, stdout, stderr io.Writer, opts analyzeOptio
 	// Same reasoning as the flush above: retention is a server-wide
 	// property of query_log/query_views_log, not scoped to any one
 	// database, so check it once rather than once per database.
-	retention := analyze.CheckLogRetention(ctx, client, opts.days, stdout)
+	retention := analyze.CheckLogRetention(ctx, client, opts.days, notesOut)
 
 	databases := opts.databases
 	if opts.allDatabases {
@@ -182,7 +189,7 @@ func runAnalyze(ctx context.Context, stdout, stderr io.Writer, opts analyzeOptio
 			fmt.Fprintf(stdout, "Analyzing database '%s'...\n", database)
 		}
 
-		result, err := analyze.Database(ctx, client, database, opts.days, retention, stdout)
+		result, err := analyze.Database(ctx, client, database, opts.days, retention, notesOut)
 		if err != nil {
 			fmt.Fprintf(stderr, "Error: could not analyze database '%s' - %v\n", database, err)
 			return 1
