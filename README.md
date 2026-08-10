@@ -1,8 +1,19 @@
 # ch-compass
 
-A ClickHouse optimization recommendation engine, built with [Cobra](https://github.com/spf13/cobra).
+A ClickHouse operational toolkit, built with [Cobra](https://github.com/spf13/cobra).
+Two subcommands, one binary: `analyze` recommends optimizations for a
+database, `census` collects cluster-wide inventory metrics for comparing
+clusters over time.
 
-It connects to a ClickHouse server, inspects `system.tables`, `system.parts`,
+## Build
+
+```sh
+go build -o bin/ch-compass ./cmd/ch-compass
+```
+
+## analyze
+
+Connects to a ClickHouse server, inspects `system.tables`, `system.parts`,
 `system.query_log`, `system.query_views_log`, `system.mutations`, and
 `system.data_skipping_indices`, and flags things worth looking at:
 
@@ -21,13 +32,7 @@ It connects to a ClickHouse server, inspects `system.tables`, `system.parts`,
 - **Redundant skip indexes** — skip indexes on columns already covered by
   the table's sorting-key prefix.
 
-## Build
-
-```sh
-go build -o bin/ch-compass ./cmd/ch-compass
-```
-
-## Run
+### Run
 
 ```sh
 go run ./cmd/ch-compass analyze --database mydb
@@ -38,9 +43,9 @@ go run ./cmd/ch-compass analyze --database mydb --format md --output report.md
 go run ./cmd/ch-compass analyze --database mydb --cluster my_cluster
 ```
 
-## Permissions
+### Permissions
 
-ch-compass is read-only — it never executes the `DROP VIEW` / `ALTER TABLE
+`analyze` is read-only — it never executes the `DROP VIEW` / `ALTER TABLE
 ... DROP INDEX` / `KILL MUTATION` statements it suggests, only prints them.
 It only ever runs `SELECT` queries plus `SYSTEM FLUSH LOGS`, so the
 ClickHouse user it connects as only needs grants for those.
@@ -59,7 +64,7 @@ GRANT SELECT ON system.query_views_log TO ch_compass;
 GRANT SYSTEM FLUSH LOGS ON *.* TO ch_compass;
 ```
 
-`GRANT SELECT ON mydb.*` matters even though ch-compass never reads a row of
+`GRANT SELECT ON mydb.*` matters even though `analyze` never reads a row of
 actual table data: ClickHouse filters `system.tables`/`system.parts`/etc. to
 only the databases/tables the connecting user can see, so without it those
 system tables look empty for `mydb` regardless of the `system.*` grants
@@ -69,7 +74,7 @@ above.
 ch_compass` plus `SELECT` on every database it should discover (or just
 `GRANT SELECT ON *.* TO ch_compass` for simplicity).
 
-Every system table ch-compass reads is per-node, which matters on a
+Every system table `analyze` reads is per-node, which matters on a
 replicated/sharded server: connecting to a single host only sees that
 host's slice. Pass `--cluster <name>` to read cluster-wide instead — it
 needs the same grants as above readable on every node (typically identical
@@ -81,7 +86,7 @@ what the underlying table holds:
 - `system.query_log`/`system.query_views_log` hold **events** — a query or
   MV trigger is logged once, on whichever node handled it, never
   duplicated across replicas. Without `--cluster`, activity that landed on
-  a different host than the one ch-compass is connected to won't show up,
+  a different host than the one `analyze` is connected to won't show up,
   which can make a still-used view, materialized view, or table look
   unused/cold. `--cluster` reads these via `clusterAllReplicas(...)`,
   safely unioning activity from every replica of every shard.
@@ -105,7 +110,7 @@ from.
 own TTL/rotation, independent of `--days` — if that TTL is shorter than the
 requested window, table/view access, cold tables, and unused views/MVs all
 silently lose accuracy: no data that far back looks exactly like no
-activity that far back. ch-compass checks actual retention once per run
+activity that far back. `analyze` checks actual retention once per run
 and, when it falls short of `--days`, prints a `Note: ... only retains N
 day(s) of history ...` and caps table/view access, cold tables, and unused
 views/MVs to that shorter window instead of confidently claiming the full
@@ -113,19 +118,106 @@ views/MVs to that shorter window instead of confidently claiming the full
 enabled), the affected check is skipped outright for that database rather
 than reporting "unused" from what's actually "no history to check".
 
+## census
+
+Collects cluster-wide inventory metrics — not tied to a single database,
+unlike `analyze` — meant for comparing clusters against each other, or the
+same cluster over time:
+
+- **Database/table counts** — totals, per-engine breakdowns, max/min tables
+  per database, and how many databases have zero tables.
+- **Materialized view topology** — how many MVs have a resolvable `TO`
+  target, how many tables are "landing" tables (receive direct inserts, not
+  populated by an MV), how many MVs read directly from a landing table vs.
+  from another MV's output, and fan-in (multiple MVs writing to the same
+  target table — often a sign of orphaned MVs from old deploys).
+- **Empty tables** — how many tables hold zero rows, cross-checked both via
+  the cached `total_rows` column and independently via `system.parts`.
+- **Replica desync** — per-replica table/MV/view counts, to spot a replica
+  falling behind or diverging from the rest of the cluster.
+
+### Run
+
+```sh
+go run ./cmd/ch-compass census --host localhost --user default
+go run ./cmd/ch-compass census --host localhost --format json --output census.json
+go run ./cmd/ch-compass census --host localhost --cluster my_cluster --format csv
+```
+
+- `--cluster` (optional): a ClickHouse cluster name registered in
+  `system.clusters`. When set, adds per-replica desync metrics gathered via
+  `clusterAllReplicas(...)`. Omit it to skip those and only collect
+  cluster-wide metrics.
+- `--format`: `text` (default, aligned table), `json`, or `csv`.
+- `--output`: write to a file instead of stdout.
+
+Every metric is `{metric, labels, value}` — `labels` is empty/omitted for
+scalar metrics (e.g. `total_tables`). For a breakdown, `labels` is a map
+keyed by what it identifies, so a row is self-describing without needing to
+already know what each metric name means: `{"metric":
+"table_count_by_engine", "labels": {"engine": "ReplicatedMergeTree"},
+"value": 11065}`, or `{"metric": "replica_table_count", "labels": {"replica":
+"ch1"}, "value": 13}`. In CSV, `labels` is that same map JSON-encoded into
+one column (there's no native map type in CSV). This flat, long shape is
+meant to be easy to feed into a time-series store for cross-cluster
+comparison — nothing in `census` ships the data anywhere itself, it only
+collects and prints/exports.
+
+### Permissions
+
+`census` is read-only — it only runs `SELECT` queries against
+`system.databases`, `system.tables`, and `system.parts` (plus
+`clusterAllReplicas` over `system.tables` when `--cluster` is set). Minimum
+grants:
+
+```sql
+GRANT SELECT ON system.databases TO ch_compass;
+GRANT SELECT ON system.tables TO ch_compass;
+GRANT SELECT ON system.parts TO ch_compass;
+```
+
 ## Dev ClickHouse
 
-`compose.yml` spins up a ClickHouse server seeded with sample tables/views
-(over-partitioned table, cold tables, materialized views, ...) for trying
-the tool out locally:
+`compose.yml` spins up a two-node ClickHouse cluster (`ch1`, `ch2`, wired
+into `test_cluster` via `dev/clickhouse/config/cluster.xml`) seeded with a
+fixture covering both subcommands: `analyze`'s sample tables/views
+(over-partitioned table, cold tables, materialized views, ...) and
+`census`'s topology cases (empty databases, a database with tables but all
+of them empty, a landing table feeding live materialized views — explicit
+`TO`, implicit/inner-table target, and two MVs fanning into the same
+target — a plain view, and empty tables with zero parts). `ch2`
+additionally gets one extra table `ch1` doesn't have, so `--cluster
+test_cluster` has a real, reproducible desync to detect. See
+`dev/clickhouse/init/*.sql` for exactly which file covers which case.
+
+A third service, `keeper` (ClickHouse Keeper), backs distributed DDL for
+both nodes: `census`'s cluster-wide reads are plain `SELECT`s and don't
+need it, but `analyze --cluster` also issues `SYSTEM FLUSH LOGS ON
+CLUSTER`, which is DDL and requires a ZooKeeper/Keeper configured.
+
+`--host localhost` with the default port always reaches `ch1` alone, so the
+non-cluster examples above work unchanged against a single node:
 
 ```sh
 docker compose up -d
 go run ./cmd/ch-compass analyze --database demo
-docker compose down
+go run ./cmd/ch-compass census --host localhost
+docker compose down -v
+```
+
+Pass `--cluster test_cluster` to either subcommand to exercise both nodes
+at once:
+
+```sh
+docker compose up -d
+go run ./cmd/ch-compass analyze --database demo --cluster test_cluster
+go run ./cmd/ch-compass census --host localhost --cluster test_cluster
+docker compose down -v
 ```
 
 ### Flags
+
+`analyze`:
 
 | Flag              | Default      | Description                                                               |
 | ----------------- | ------------ | ------------------------------------------------------------------------- |
@@ -149,22 +241,41 @@ docker compose down
 Exit code is `0` when no recommendation survives the severity filter, `1`
 otherwise (or on a connection/query error) — handy for CI gating.
 
+`census`:
+
+| Flag           | Default     | Description                                                                     |
+| -------------- | ----------- | -------------------------------------------------------------------------------- |
+| `--host`       | `localhost` | ClickHouse host                                                                  |
+| `-p, --port`   | `8123`      | ClickHouse HTTP port                                                             |
+| `-u, --user`   |             | ClickHouse username                                                              |
+| `--password`   |             | ClickHouse password                                                              |
+| `-f, --format` | `text`      | Output format: `text`, `json`, or `csv`                                         |
+| `-o, --output` |             | Write output to a file instead of stdout                                        |
+| `--debug`      |             | Print SQL queries as they run                                                   |
+| `--secure`     |             | Use HTTPS/TLS for the ClickHouse connection                                     |
+| `--cluster`    |             | ClickHouse cluster name (`system.clusters`); enables per-replica desync metrics |
+
+Exit code is `0` on success, `1` on a connection/query/render error.
+
 ## Layout
 
 ```
-cmd/ch-compass/     main entrypoint
-internal/cli/       command tree (root, version, analyze)
-internal/ch/        ClickHouse connection + query wrapper
-internal/analyze/   collectors + analyzers + the Recommendation model
-internal/report/    text (terminal), JSON, HTML, and Markdown rendering
+cmd/ch-compass/         main entrypoint
+internal/cli/           command tree (root, version, analyze, census)
+internal/ch/            ClickHouse connection + query wrapper (shared)
+internal/analyze/       collectors + analyzers + the Recommendation model
+internal/analyze/report/  text (terminal), JSON, HTML, and Markdown rendering for analyze
+internal/census/        cluster-wide inventory collectors + the Metric model
+internal/census/report/  text (terminal), JSON, and CSV rendering for census
 ```
 
 `internal/analyze` collects table/query/mutation/index metrics concurrently
 for each database and runs every analyzer against them, returning one
-`analyze.Result` per database. `internal/cli` and `internal/report` are the
-only things that know about flags, exit codes, and how the output looks.
-See [docs/ROADMAP.md](docs/ROADMAP.md) for ideas on what could be added
-next.
+`analyze.Result` per database. `internal/census` collects cluster-wide
+metrics in one pass, returning `[]census.Metric`. `internal/cli` and the two
+`report` packages are the only things that know about flags, exit codes,
+and how the output looks. See [docs/ROADMAP.md](docs/ROADMAP.md) for ideas
+on what could be added next.
 
 ## Add an analyzer
 
@@ -174,7 +285,7 @@ next.
    `Database()`.
 2. Call the rule from `Database()` in `internal/analyze/analyze.go`.
 3. Add a human-readable label for the new `RecType` to `typeLabels` in
-   `internal/report/text.go` (used by all four output formats).
+   `internal/analyze/report/text.go` (used by all four output formats).
 
 ## Version at build time
 

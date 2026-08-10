@@ -6,17 +6,14 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/lipgloss/table"
 
 	"github.com/josemimbre/ch-compass/internal/analyze"
+	"github.com/josemimbre/ch-compass/internal/termtable"
 )
 
 var (
-	faintStyle  = lipgloss.NewStyle().Faint(true)
-	boldStyle   = lipgloss.NewStyle().Bold(true)
-	cyanStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
-	greenStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	borderColor = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	cyanStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	greenStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 )
 
 var severityColors = map[analyze.Severity]lipgloss.Color{
@@ -39,12 +36,12 @@ var typeLabels = map[analyze.RecType]string{
 // grouped by database when there's more than one.
 func WriteText(w io.Writer, results []analyze.Result, version string, minSeverity *analyze.Severity, quiet bool) {
 	if !quiet {
-		fmt.Fprintln(w, faintStyle.Render(fmt.Sprintf("ClickHouse %s", version)))
+		fmt.Fprintln(w, termtable.Faint.Render(fmt.Sprintf("ClickHouse %s", version)))
 		fmt.Fprintln(w)
 
 		for _, r := range results {
 			if len(results) > 1 {
-				fmt.Fprintln(w, boldStyle.Render(fmt.Sprintf("Database: %s", r.Database)))
+				fmt.Fprintln(w, termtable.Bold.Render(fmt.Sprintf("Database: %s", r.Database)))
 			}
 			writeObjectsTable(w, r.Tables, r.Views)
 		}
@@ -71,20 +68,7 @@ func writeObjectsTable(w io.Writer, tables, views []analyze.TableInfo) {
 		rows = append(rows, []string{v.Name, v.Engine, "-", "-", "-"})
 	}
 
-	t := table.New().
-		Border(lipgloss.RoundedBorder()).
-		BorderStyle(borderColor).
-		StyleFunc(func(row, col int) lipgloss.Style {
-			style := lipgloss.NewStyle().Padding(0, 1)
-			if row == table.HeaderRow {
-				return style.Bold(true)
-			}
-			return style
-		}).
-		Headers("Name", "Engine", "Rows", "Size", "Partitions").
-		Rows(rows...)
-
-	fmt.Fprintln(w, t.Render())
+	fmt.Fprintln(w, termtable.Render([]string{"Name", "Engine", "Rows", "Size", "Partitions"}, rows))
 	fmt.Fprintln(w)
 }
 
@@ -102,7 +86,7 @@ func writeRecommendations(w io.Writer, results []analyze.Result, all []analyze.R
 		}
 
 		if multiDB {
-			fmt.Fprintln(w, boldStyle.Render(fmt.Sprintf("Database: %s", r.Database)))
+			fmt.Fprintln(w, termtable.Bold.Render(fmt.Sprintf("Database: %s", r.Database)))
 		}
 		for _, rec := range recs {
 			writeRecommendation(w, rec)
@@ -114,7 +98,7 @@ func writeRecommendations(w io.Writer, results []analyze.Result, all []analyze.R
 }
 
 func writeRecommendation(w io.Writer, rec analyze.Recommendation) {
-	header := fmt.Sprintf("%s %s", severityBadge(rec.Severity), boldStyle.Render(fmt.Sprintf("%s '%s'", formatType(rec.Type), rec.Object)))
+	header := fmt.Sprintf("%s %s", severityBadge(rec.Severity), termtable.Bold.Render(fmt.Sprintf("%s '%s'", formatType(rec.Type), rec.Object)))
 	body := fmt.Sprintf("%s\n%s", rec.Message, cyanStyle.Render("→ "+rec.Suggestion))
 
 	box := lipgloss.NewStyle().
@@ -136,10 +120,10 @@ func writeSummary(w io.Writer, recs []analyze.Recommendation) {
 		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render(fmt.Sprintf("%d medium", medium)))
 	}
 	if low > 0 {
-		parts = append(parts, faintStyle.Render(fmt.Sprintf("%d low", low)))
+		parts = append(parts, termtable.Faint.Render(fmt.Sprintf("%d low", low)))
 	}
 
-	summary := boldStyle.Render(fmt.Sprintf("%d recommendations", len(recs)))
+	summary := termtable.Bold.Render(fmt.Sprintf("%d recommendations", len(recs)))
 	if len(parts) > 0 {
 		joined := parts[0]
 		for _, p := range parts[1:] {

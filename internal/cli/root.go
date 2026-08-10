@@ -12,8 +12,8 @@ var version = "dev"
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "ch-compass",
-		Short:         "ClickHouse optimization recommendation engine",
-		Long:          "ch-compass analyzes a ClickHouse database and recommends optimizations: unused capacity, over-partitioned tables, stuck mutations, and more.",
+		Short:         "ClickHouse optimization recommendation engine and cluster census tool",
+		Long:          "ch-compass analyzes a ClickHouse database and recommends optimizations (unused capacity, over-partitioned tables, stuck mutations, and more) via `analyze`, and collects cluster-wide inventory metrics — database/table counts, materialized view topology, replica desync — via `census`.",
 		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: false,
@@ -21,6 +21,7 @@ func NewRootCmd() *cobra.Command {
 
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newAnalyzeCmd())
+	root.AddCommand(newCensusCmd())
 
 	return root
 }
