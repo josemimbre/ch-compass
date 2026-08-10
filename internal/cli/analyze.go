@@ -11,8 +11,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/josemimbre/ch-compass/internal/analyze"
+	"github.com/josemimbre/ch-compass/internal/analyze/report"
 	"github.com/josemimbre/ch-compass/internal/ch"
-	"github.com/josemimbre/ch-compass/internal/report"
 )
 
 // errAnalyzeFailed signals a non-zero exit code from runAnalyze. Its message
@@ -22,12 +22,11 @@ var errAnalyzeFailed = errors.New("analyze failed")
 
 func newAnalyzeCmd() *cobra.Command {
 	var (
-		host, database, username, password string
-		output, cluster                    string
-		port                               int
-		format, severity                   string
-		days                               int
-		debug, quiet, secure, allDatabases bool
+		conn                      connectionFlags
+		database, output, cluster string
+		format, severity          string
+		days                      int
+		quiet, allDatabases       bool
 	)
 
 	cmd := &cobra.Command{
@@ -63,20 +62,15 @@ func newAnalyzeCmd() *cobra.Command {
 			stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 
 			if code := runAnalyze(cmd.Context(), stdout, stderr, analyzeOptions{
-				host:         host,
-				port:         port,
-				databases:    databases,
-				allDatabases: allDatabases,
-				username:     username,
-				password:     password,
-				secure:       secure,
-				debug:        debug,
-				quiet:        quiet,
-				days:         days,
-				cluster:      cluster,
-				format:       format,
-				output:       output,
-				minSeverity:  minSeverity,
+				connectionFlags: conn,
+				databases:       databases,
+				allDatabases:    allDatabases,
+				quiet:           quiet,
+				days:            days,
+				cluster:         cluster,
+				format:          format,
+				output:          output,
+				minSeverity:     minSeverity,
 			}); code != 0 {
 				// runAnalyze already reported the failure (or the found
 				// recommendations) to stderr/stdout itself; suppress
@@ -88,35 +82,29 @@ func newAnalyzeCmd() *cobra.Command {
 		},
 	}
 
+	conn.register(cmd)
 	flags := cmd.Flags()
-	flags.StringVar(&host, "host", "localhost", "ClickHouse host")
-	flags.IntVarP(&port, "port", "p", 8123, "ClickHouse HTTP port")
 	flags.StringVarP(&database, "database", "d", "", "Database name(s) to analyze (comma-separated for multiple)")
 	flags.BoolVar(&allDatabases, "all-databases", false, "Analyze every database on the server (excluding system schemas)")
-	flags.StringVarP(&username, "user", "u", "", "ClickHouse username")
-	flags.StringVar(&password, "password", "", "ClickHouse password")
 	flags.StringVarP(&format, "format", "f", "text", "Output format: text, json, html, or md")
 	flags.StringVarP(&output, "output", "o", "", "Write output to file instead of stdout (useful with html/md formats)")
 	flags.StringVarP(&severity, "severity", "s", "", "Minimum severity to show: low, medium, or high")
 	flags.IntVar(&days, "days", 30, "Analysis window in days")
-	flags.BoolVar(&debug, "debug", false, "Print SQL queries as they are executed")
 	flags.BoolVarP(&quiet, "quiet", "q", false, "Only output recommendations, no connection info or table listing")
-	flags.BoolVar(&secure, "secure", false, "Use HTTPS for ClickHouse connection (TLS)")
 	flags.StringVar(&cluster, "cluster", "", "ClickHouse cluster name: widens query-log-based detection (table access, unused views/MVs) across every host in the cluster instead of just the connected node")
 
 	return cmd
 }
 
 type analyzeOptions struct {
-	host, username, password string
-	output, cluster          string
-	port                     int
-	databases                []string
-	allDatabases             bool
-	secure, debug, quiet     bool
-	days                     int
-	format                   string
-	minSeverity              *analyze.Severity
+	connectionFlags
+	output, cluster string
+	databases       []string
+	allDatabases    bool
+	quiet           bool
+	days            int
+	format          string
+	minSeverity     *analyze.Severity
 }
 
 // runAnalyze connects to ClickHouse, analyzes every configured database,
@@ -124,7 +112,7 @@ type analyzeOptions struct {
 // recommendations survive the severity filter, 1 otherwise or on error.
 func runAnalyze(ctx context.Context, stdout, stderr io.Writer, opts analyzeOptions) int {
 	if opts.format == "text" && !opts.quiet {
-		fmt.Fprintf(stdout, "Connecting to %s:%d...\n", opts.host, opts.port)
+		fmt.Fprintf(stdout, "Connecting to %s:%d...\n", opts.Host, opts.Port)
 	}
 
 	connectDatabase := "default"
@@ -133,13 +121,13 @@ func runAnalyze(ctx context.Context, stdout, stderr io.Writer, opts analyzeOptio
 	}
 
 	client, err := ch.Connect(ctx, ch.Options{
-		Host:     opts.host,
-		Port:     opts.port,
+		Host:     opts.Host,
+		Port:     opts.Port,
 		Database: connectDatabase,
-		Username: opts.username,
-		Password: opts.password,
-		Secure:   opts.secure,
-		Debug:    opts.debug,
+		Username: opts.Username,
+		Password: opts.Password,
+		Secure:   opts.Secure,
+		Debug:    opts.Debug,
 		Cluster:  opts.cluster,
 	}, stderr)
 	if err != nil {

@@ -1,0 +1,6 @@
+<!-- The clickhouse-keeper image's default config binds to 127.0.0.1 only,
+     which refuses connections from ch1/ch2 (separate containers on the
+     compose network). Override to listen on all interfaces. -->
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+</clickhouse>
